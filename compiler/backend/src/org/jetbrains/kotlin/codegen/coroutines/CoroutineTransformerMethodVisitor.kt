@@ -45,6 +45,8 @@ private const val COROUTINES_METADATA_METHOD_NAME_JVM_NAME = "m"
 private const val COROUTINES_METADATA_CLASS_NAME_JVM_NAME = "c"
 private const val COROUTINES_METADATA_VERSION_JVM_NAME = "v"
 
+private const val CONTINUATION_VAR_NAME = "\$continuation"
+
 class CoroutineTransformerMethodVisitor(
     delegate: MethodVisitor,
     access: Int,
@@ -133,19 +135,15 @@ class CoroutineTransformerMethodVisitor(
             transformCallAndReturnContinuationLabel(it.index + 1, it.value, methodNode, suspendMarkerVarIndex)
         }
 
-        val defaultLabel = LabelNode()
         val tableSwitchLabel = LabelNode()
         methodNode.instructions.apply {
-            // The very first instruction of suspend lambda's 'invokeSuspend' method shall be label, otherwise, d8 emits warning about
-            // invalid debug info
-            val startLabel = LabelNode()
             val firstStateLabel = LabelNode()
+            val defaultLabel = LabelNode()
 
             // tableswitch(this.label)
             insertBefore(
                 actualCoroutineStart,
                 insnListOf(
-                    startLabel,
                     *withInstructionAdapter { loadCoroutineSuspendedMarker(languageVersionSettings) }.toArray(),
                     tableSwitchLabel,
                     // Allow debugger to stop on enter into suspend function
@@ -172,25 +170,22 @@ class CoroutineTransformerMethodVisitor(
                 AsmUtil.genThrow(this, "java/lang/IllegalStateException", "call to 'resume' before 'invoke' with coroutine")
                 areturn(Type.VOID_TYPE)
             })
+
+            if (isForNamedFunction) {
+                setEndLabelForContinuation(methodNode, defaultLabel)
+            }
         }
 
         dropSuspensionMarkers(methodNode, suspensionPoints)
         methodNode.removeEmptyCatchBlocks()
 
-        // The very last instruction shall be label, since parameters must be alive throughout the method's body. Otherwise, d8 emits
-        // warning about invalid debug info
+        // The parameters (and 'this') shall live throughout the method, otherwise, d8 emits warning about invalid debug info
+        val startLabel = LabelNode()
         val endLabel = LabelNode()
+        methodNode.instructions.insertBefore(methodNode.instructions.first, startLabel)
         methodNode.instructions.insert(methodNode.instructions.last, endLabel)
 
-        val startLabel = methodNode.instructions.first as? LabelNode
-            ?: error("The very first instruction of method shall be LabelNode, but got ${methodNode.instructions.first}")
         fixLvtForParameters(methodNode, startLabel, endLabel)
-
-        if (isForNamedFunction) {
-            // ACHTUNG! This is _continuation_, not _completion_, it can be allocated inside the method, thus, it is incorrect to treat it
-            // as a parameter
-            addContinuationToLvt(methodNode, tableSwitchLabel, defaultLabel)
-        }
 
         if (languageVersionSettings.isReleaseCoroutines() && !isCrossinlineLambda) {
             val suspensionPointLabelNodes = listOf(tableSwitchLabel) + suspensionPointLabels.map {
@@ -201,10 +196,21 @@ class CoroutineTransformerMethodVisitor(
         }
     }
 
+    private fun setEndLabelForContinuation(methodNode: MethodNode, endLabel: LabelNode) {
+        // Warning! This is _continuation_, not _completion_, it can be allocated inside the method, thus, it is incorrect to treat it
+        // as a parameter
+        methodNode.localVariables.find { it.name == CONTINUATION_VAR_NAME && it.index == continuationIndex }
+            ?.let { it.end = endLabel }
+    }
+
     private fun fixLvtForParameters(methodNode: MethodNode, startLabel: LabelNode, endLabel: LabelNode) {
+        // We need to skip continuation, since the inliner likes to remap variables there.
+        // But this is not a problem, since we have separate $continuation LVT entry
+
         val paramsNum =
                 /* this */ (if (internalNameForDispatchReceiver != null) 1 else 0) +
-                /* real params */ Type.getArgumentTypes(methodNode.desc).size
+                /* real params */ Type.getArgumentTypes(methodNode.desc).size -
+                /* no continuation */ if (isForNamedFunction) 1 else 0
 
         for (i in 0..paramsNum) {
             fixRangeOfLvtRecord(methodNode, i, startLabel, endLabel)
@@ -216,7 +222,10 @@ class CoroutineTransformerMethodVisitor(
         assert(vars.size <= 1) {
             "Someone else occupies parameter's slot at $index"
         }
-        vars.firstOrNull()?.let { it.start = startLabel; it.end = endLabel }
+        vars.firstOrNull()?.let {
+            it.start = startLabel
+            it.end = endLabel
+        }
     }
 
     private fun writeDebugMetadata(
@@ -251,14 +260,14 @@ class CoroutineTransformerMethodVisitor(
         metadata.visitEnd()
     }
 
-    private fun addContinuationToLvt(methodNode: MethodNode, startLabel: LabelNode, endLabel: LabelNode) {
+    private fun addContinuationToLvt(methodNode: MethodNode, startLabel: LabelNode) {
         methodNode.localVariables.add(
             LocalVariableNode(
-                "\$continuation",
+                CONTINUATION_VAR_NAME,
                 languageVersionSettings.continuationAsmType().descriptor,
                 null,
                 startLabel,
-                endLabel,
+                startLabel,
                 continuationIndex
             )
         )
@@ -329,7 +338,6 @@ class CoroutineTransformerMethodVisitor(
         }
 
         methodNode.instructions.insert(withInstructionAdapter {
-            val startLabel = LabelNode()
             val createStateInstance = Label()
             val afterCoroutineStateCreated = Label()
 
@@ -348,7 +356,6 @@ class CoroutineTransformerMethodVisitor(
             // `doResume` just before calling the suspend function (see kotlin.coroutines.experimental.jvm.internal.CoroutineImplForNamedFunction).
             // So, if it's set we're in continuation.
 
-            visitLabel(startLabel.label)
             visitVarInsn(Opcodes.ALOAD, continuationArgumentIndex)
             instanceOf(objectTypeForState)
             ifeq(createStateInstance)
@@ -389,6 +396,8 @@ class CoroutineTransformerMethodVisitor(
             visitVarInsn(Opcodes.ASTORE, continuationIndex)
 
             visitLabel(afterCoroutineStateCreated)
+
+            addContinuationToLvt(methodNode, LabelNode(afterCoroutineStateCreated))
 
             visitVarInsn(Opcodes.ALOAD, continuationIndex)
             getfield(classBuilderForCoroutineState.thisName, languageVersionSettings.dataFieldName(), AsmTypes.OBJECT_TYPE.descriptor)
